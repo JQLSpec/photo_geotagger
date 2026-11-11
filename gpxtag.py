@@ -43,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from typing import List, Optional, Tuple
@@ -231,14 +232,16 @@ def _read_gpx(path: str, segs) -> Tuple[List[TrackPoint], int]:
     return pts, untimed
 
 
-def load_tracks(paths: List[str]) -> List[TrackPoint]:
+def load_tracks(paths: List[str], quiet: bool = False) -> List[TrackPoint]:
     """Read all GPX files and combine their track points.
 
-    The function shows a status line for each file. If no file has
-    track points with a time, the script stops with exit code 2.
+    The function shows a status line for each file, unless quiet is
+    True. If no file has track points with a time, the script stops
+    with exit code 2.
 
     Args:
         paths: The paths to the GPX files.
+        quiet: If True, do not show the status lines.
 
     Returns:
         All track points from all files, in time sequence.
@@ -249,7 +252,9 @@ def load_tracks(paths: List[str]) -> List[TrackPoint]:
         got, untimed = _read_gpx(path, segs)
         name = os.path.basename(path)
         # Tell the user what the script found in this file.
-        if got:
+        if quiet:
+            pass
+        elif got:
             note = f" ({untimed} more without times were ignored)" if untimed else ""
             print(f"Read {name}: {len(got)} timed points{note}")
         elif untimed:
@@ -475,20 +480,59 @@ def parse_shift(spec: str) -> float:
 _OFFSET_RE = re.compile(r"^([+-])(\d\d):?(\d\d)$")
 # The EXIF tags that can contain the UTC offset, in sequence of priority.
 OFFSET_TAGS = ("OffsetTimeOriginal", "OffsetTimeDigitized", "OffsetTime")
+# The date tags that the script reads, and the offset tag that belongs to
+# each date tag.
+DATE_OFFSET_TAGS = {
+    "SubSecDateTimeOriginal": "OffsetTimeOriginal",
+    "DateTimeOriginal": "OffsetTimeOriginal",
+    "CreateDate": "OffsetTimeDigitized",
+}
+# The range of real UTC offsets: UTC-12:00 to UTC+14:00.
+MIN_OFFSET = -timedelta(hours=12)
+MAX_OFFSET = timedelta(hours=14)
 
 
-def photo_offset(rec: dict) -> Optional[str]:
+def parse_offset(text: str) -> timedelta:
+    """Change an offset text into a time difference.
+
+    Args:
+        text: An offset in the format "+HH:MM" or "-HHMM".
+
+    Returns:
+        The offset as a time difference from UTC.
+
+    Raises:
+        ValueError: The text is not a valid offset.
+    """
+    m = _OFFSET_RE.match(text)
+    if not m:
+        raise ValueError(f"bad UTC offset: {text!r}")
+    sign = 1 if m.group(1) == "+" else -1
+    return sign * timedelta(hours=int(m.group(2)), minutes=int(m.group(3)))
+
+
+def photo_offset(rec: dict, date_tag: Optional[str] = None) -> Optional[str]:
     """Find the UTC offset that the camera stored in the photo.
+
+    Each date tag has its own offset tag. If the caller gives the date
+    tag, the function first uses the offset tag that belongs to it.
+    Then it uses the other offset tags.
 
     Args:
         rec: The exiftool data for one photo.
+        date_tag: The date tag that gave the capture time, or None.
 
     Returns:
         The offset in the format "+HH:MM". The function returns None
         if the photo has no valid offset.
     """
+    keys = list(OFFSET_TAGS)
+    own = DATE_OFFSET_TAGS.get(date_tag or "")
+    if own:
+        keys.remove(own)
+        keys.insert(0, own)
     # Use the first tag that has a valid offset.
-    for key in OFFSET_TAGS:
+    for key in keys:
         v = rec.get(key)
         if isinstance(v, str):
             v = v.strip()
@@ -513,6 +557,26 @@ def fmt_offset(off: timedelta) -> str:
     sign = "-" if mins < 0 else "+"
     h, m = divmod(abs(mins), 60)
     return f"{sign}{h:02d}:{m:02d}"
+
+
+def _same_rules(ids: List[str]) -> bool:
+    """Find out if some time zones always have the same UTC offset.
+
+    The function compares the offsets each day from 1970 to 2040.
+
+    Args:
+        ids: Time zone IDs, for example "America/Buenos_Aires".
+
+    Returns:
+        True if all the time zones have the same offset on each day.
+    """
+    zones = [ZoneInfo(z) for z in ids]
+    t = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    while t.year < 2040:
+        if len({t.astimezone(z).utcoffset() for z in zones}) > 1:
+            return False
+        t += timedelta(days=1)
+    return True
 
 
 def resolve_tz(spec: str) -> Tuple[tzinfo, str]:
@@ -543,9 +607,9 @@ def resolve_tz(spec: str) -> Tuple[tzinfo, str]:
     m = re.fullmatch(r"(?:utc|gmt)?\s*([+-])(\d{1,2})(?::?(\d\d))?", low)
     if m:
         h, mm = int(m.group(2)), int(m.group(3) or 0)
-        if h > 14 or mm >= 60:
-            sys.exit(f"error: {raw!r} isn't a real UTC offset")
         off = (1 if m.group(1) == "+" else -1) * timedelta(hours=h, minutes=mm)
+        if mm >= 60 or not MIN_OFFSET <= off <= MAX_OFFSET:
+            sys.exit(f"error: {raw!r} isn't a real UTC offset (they go from -12:00 to +14:00)")
         return timezone(off), f"UTC{fmt_offset(off)}"
 
     # A place name. Make sure that the time zone database is available.
@@ -578,6 +642,12 @@ def resolve_tz(spec: str) -> Tuple[tzinfo, str]:
     real = [z for z in ids if "/" in z and not z.startswith(("Etc/", "SystemV/", "US/"))]
     # First, compare with the full zone ID. Then, compare with the city part only.
     hits = [z for z in real if norm(z) == n] or [z for z in real if norm(z.split("/")[-1]) == n]
+    # Some places have an old alias ID and a current ID, for example
+    # America/Buenos_Aires and America/Argentina/Buenos_Aires. If all the
+    # hits have the same rules, they are one place. Use the longest ID,
+    # which is usually the current one.
+    if len(hits) > 1 and _same_rules(hits):
+        hits = [sorted(hits, key=lambda z: (-z.count("/"), z))[0]]
     if len(hits) == 1:
         return ZoneInfo(hits[0]), hits[0]
     if len(hits) > 1:
@@ -595,35 +665,42 @@ def resolve_tz(spec: str) -> Tuple[tzinfo, str]:
 
 
 def photo_timestamp(rec: dict, tz_override: Optional[tzinfo] = None
-                    ) -> Tuple[Optional[float], str, str]:
+                    ) -> Tuple[List[Tuple[float, str]], str]:
     """Find the capture time of a photo in UTC.
 
     The function uses the time zone in this sequence of priority:
 
     1. The --tz time zone, if the user gave one.
-    2. The UTC offset that the camera stored in the photo.
+    2. The UTC offset that the camera stored in the photo. The function
+       first uses the offset tag that belongs to the date tag.
     3. A time zone that is part of the date and time text.
+
+    With a --tz place, a clock time can be ambiguous. When daylight saving
+    time ends, the clock shows the same hour two times. When it starts, the
+    clock skips an hour. In these two cases, the function gives two
+    possible times.
 
     Args:
         rec: The exiftool data for one photo.
         tz_override: The time zone from --tz, or None.
 
     Returns:
-        A tuple with three items. If the function finds the time, the
-        items are: the POSIX timestamp in UTC, an empty text, and the
-        offset that it used. If it does not find the time, the items are:
-        None, the reason, and an empty text.
+        A tuple with two items: a list of possible times, and a reason.
+        Each possible time is a tuple of the POSIX timestamp in UTC and
+        the offset that the function used. Usually the list has one item.
+        If the function does not find the time, the list is empty and the
+        reason tells why.
     """
     # Find the first tag that has a valid capture time.
-    raw = None
-    for key in ("SubSecDateTimeOriginal", "DateTimeOriginal", "CreateDate"):
+    raw = date_tag = None
+    for key in DATE_OFFSET_TAGS:
         v = rec.get(key)
         if isinstance(v, str) and not v.startswith("0000"):
-            raw = v
+            raw, date_tag = v, key
             break
     m = _EXIF_DT_RE.match(raw) if raw else None
     if not m:
-        return None, "no capture time in the photo", ""
+        return [], "no capture time in the photo"
     y, mo, d, hh, mi, ss, frac, inline_tz = m.groups()
     dt = datetime(int(y), int(mo), int(d), int(hh), int(mi), int(ss))
     if frac:
@@ -632,20 +709,25 @@ def photo_timestamp(rec: dict, tz_override: Optional[tzinfo] = None
     # Priority 1: the --tz time zone.
     if tz_override is not None:
         # A place time zone calculates daylight saving time from the date
-        # of this photo.
-        aware = dt.replace(tzinfo=tz_override)
-        return aware.timestamp(), "", fmt_offset(aware.utcoffset())
+        # of this photo. Fold 0 and fold 1 are the two possible readings
+        # of an ambiguous clock time. They are equal for other times.
+        out = []
+        for fold in (0, 1):
+            aware = dt.replace(tzinfo=tz_override, fold=fold)
+            cand = (aware.timestamp(), fmt_offset(aware.utcoffset()))
+            if cand not in out:
+                out.append(cand)
+        return out, ""
 
     # Priority 2 and 3: the stored offset, or the time zone in the text.
-    off = photo_offset(rec)
+    off = photo_offset(rec, date_tag)
     if off is None and inline_tz:
         off = "+00:00" if inline_tz == "Z" else inline_tz
     if off is None:
-        return None, "no time zone stored in the photo (use --tz)", ""
-    om = _OFFSET_RE.match(off)
-    sign = 1 if om.group(1) == "+" else -1
-    tz = timezone(sign * timedelta(hours=int(om.group(2)), minutes=int(om.group(3))))
-    return dt.replace(tzinfo=tz).timestamp(), "", off
+        return [], "no time zone stored in the photo (use --tz)"
+    off = fmt_offset(parse_offset(off))
+    tz = timezone(parse_offset(off))
+    return [(dt.replace(tzinfo=tz).timestamp(), off)], ""
 
 
 def camera_reading(rec: dict) -> Optional[str]:
@@ -754,7 +836,8 @@ def read_photos(paths: List[str], recursive: bool, exts: List[str]) -> List[dict
     return [r for r in recs if str(r.get("MIMEType", "")).startswith("image/")]
 
 
-def write_gps(jobs: List[Tuple[str, Fix, float]], backup: bool, keep_mtime: bool) -> Tuple[int, List[str]]:
+def write_gps(jobs: List[Tuple[str, Fix, float]], backup: bool, keep_mtime: bool,
+              clear: bool = False) -> Tuple[int, List[str]]:
     """Write the GPS tags into the photos with exiftool.
 
     The function writes all commands into one argument file. Thus,
@@ -766,6 +849,9 @@ def write_gps(jobs: List[Tuple[str, Fix, float]], backup: bool, keep_mtime: bool
         backup: If True, exiftool keeps a copy of each original file
             (FILE_original). If False, exiftool changes the file in place.
         keep_mtime: If True, exiftool keeps the file modification time.
+        clear: If True, exiftool first deletes all EXIF GPS tags of the
+            photo. Use this with --overwrite, so that no old GPS tag (for
+            example an old altitude) stays with the new position.
 
     Returns:
         A tuple with two items: the number of files that exiftool
@@ -775,6 +861,10 @@ def write_gps(jobs: List[Tuple[str, Fix, float]], backup: bool, keep_mtime: bool
     lines: List[str] = []
     for path, fix, ts in jobs:
         utc = datetime.fromtimestamp(ts, timezone.utc)
+        # Delete the old GPS tags before the new tags are written.
+        # exiftool applies the assignments in sequence.
+        if clear:
+            lines.append("-gps:all=")
         lines += [
             f"-GPSLatitude={abs(fix.lat):.7f}",
             f"-GPSLatitudeRef={'N' if fix.lat >= 0 else 'S'}",
@@ -839,6 +929,85 @@ def fmt_shift(sec: float) -> str:
     return f"{sign}{h}:{m:02d}" + (f":{s_:02d}" if s_ else "")
 
 
+def tz_hint(track: Track, placed: List[Tuple[float, str]],
+            missed: List[Tuple[float, str]], shift: float) -> Optional[str]:
+    """Find a --tz or --shift value that places more photos.
+
+    A wrong time zone moves all photos by full or half hours. The function
+    tries each offset from -14 h to +14 h in 30-minute steps on the
+    skipped photos. The best offset must place at least half of them.
+    Then the function applies the suggested option to all photos, also
+    the photos that have a position now. It gives the hint only if the
+    option places more photos in total. If not, the skipped photos
+    probably need their own run, and the hint says this.
+
+    Note: this finds only photos that are outside the track. On a long
+    track of many days, a wrong time zone can put a photo inside the
+    track at the wrong position. Examine the --dry-run output.
+
+    Args:
+        track: The track.
+        placed: The (timestamp, offset used) of the photos that have a
+            position now. The timestamps include the --shift value.
+        missed: The (timestamp, offset used) of the photos outside the
+            track or in a gap.
+        shift: The --shift value in seconds.
+
+    Returns:
+        The hint text, or None if there is no useful hint.
+    """
+    def count(times) -> int:
+        """Count the times that have a position on the track."""
+        return sum(1 for t in times if track.locate(t)[0] is not None)
+
+    # Find the offset that places the most skipped photos.
+    # If two offsets place the same number, use the smaller offset.
+    best, best_n = 0.0, 0
+    for k in range(-28, 29):              # -14 h to +14 h in 30-minute steps
+        if k == 0:
+            continue
+        n = count(t + k * 1800 for t, _ in missed)
+        if n > best_n or (n == best_n and abs(k) < abs(best / 1800)):
+            best, best_n = k * 1800.0, n
+    # The offset must place at least half of the skipped photos.
+    if best_n == 0 or best_n < (len(missed) + 1) // 2:
+        return None
+
+    # Make the suggestion. If all skipped photos have the same offset,
+    # suggest a --tz value. Else, suggest a --shift value.
+    # Then calculate the new times of all photos with the suggestion.
+    everyone = placed + missed
+    used = {o for _, o in missed}
+    new = None
+    if len(used) == 1:
+        o = next(iter(used))
+        new_off = parse_offset(o) - timedelta(seconds=best)
+        if MIN_OFFSET <= new_off <= MAX_OFFSET:
+            new = fmt_offset(new_off)
+    if new is not None:
+        # With --tz, each photo gets the new offset instead of its own one.
+        moved = [t + (parse_offset(off) - new_off).total_seconds() for t, off in everyone]
+        short = new[:3].replace("+0", "+").replace("-0", "-") if new.endswith(":00") else new
+        advice = (f"if their time zone were UTC{new}, not UTC{o}. Try --tz {short} (or the "
+                  f"place's name, e.g. --tz \"los angeles\")")
+        own_run = f"--tz {short}"
+    else:
+        moved = [t + best for t, _ in everyone]
+        advice = f"with --shift {fmt_shift(shift + best)}"
+        own_run = f"--shift {fmt_shift(shift + best)}"
+
+    # Compare the total number of photos with a position.
+    total = count(moved)
+    lost = len(placed) - count(moved[:len(placed)])
+    if total > len(placed):
+        extra = f" ({lost} photo(s) that match now would no longer match)" if lost else ""
+        return f"Hint: {best_n} of {len(missed)} skipped photos would match {advice}.{extra}"
+    return (f"Hint: {best_n} of {len(missed)} skipped photos would match if their times "
+            f"moved by {fmt_shift(best)}, but doing that for every photo would lose more "
+            f"matches than it gains. If those photos came from another camera or have a "
+            f"wrong stored time zone, tag them in a separate run with {own_run}.")
+
+
 def main() -> int:
     """Run the gpxtag command.
 
@@ -854,12 +1023,15 @@ def main() -> int:
         The exit code. 0 means success. 1 means that exiftool gave
         errors or did not update all photos.
     """
-    # Define the command line arguments.
+    # Define the command line arguments. Use the second part of the module
+    # docstring as the epilog. With "python -OO" there is no docstring.
+    doc = __doc__ or ""
+    epilog = "Time zones are" + doc.split("Time zones are", 1)[1] if "Time zones are" in doc else None
     ap = argparse.ArgumentParser(
         prog="gpxtag",
         description="Geotag photos using the time and position data in GPX track logs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__.split("Time zones are", 1)[1].join(["Time zones are", ""]),
+        epilog=epilog,
     )
     ap.add_argument("inputs", nargs="*", metavar="PATH",
                     help="one or more .gpx files, then photo folders/files "
@@ -925,7 +1097,7 @@ def main() -> int:
 
     # Read the time zone, the tracks and the photos.
     tz_override, tz_label = resolve_tz(args.tz) if args.tz else (None, "")
-    pts = load_tracks(gpx_files)
+    pts = load_tracks(gpx_files, args.quiet)
     track = Track(pts, args.max_gap, args.tolerance)
     recs = read_photos(targets, args.recursive, args.ext)
 
@@ -936,11 +1108,9 @@ def main() -> int:
         shown_tz = tz_override
         shown_off = fmt_offset(datetime.fromtimestamp(track.start, tz_override).utcoffset())
     else:
-        offsets = [o for o in (photo_offset(r) for r in recs) if o]
-        shown_off = max(set(offsets), key=offsets.count) if offsets else "+00:00"
-        om = re.match(r"([+-])(\d\d):(\d\d)", shown_off)
-        shown_tz = timezone((1 if om.group(1) == "+" else -1)
-                            * timedelta(hours=int(om.group(2)), minutes=int(om.group(3))))
+        offsets = Counter(o for o in (photo_offset(r) for r in recs) if o)
+        shown_off = offsets.most_common(1)[0][0] if offsets else "+00:00"
+        shown_tz = timezone(parse_offset(shown_off))
 
     def clock(ts: float) -> str:
         """Change a timestamp into clock time in the time zone of the photos.
@@ -954,19 +1124,23 @@ def main() -> int:
         return datetime.fromtimestamp(ts, shown_tz).strftime("%Y-%m-%d %H:%M:%S")
 
     # Show the time zone, the track span and the number of photos.
-    if tz_override is not None:
-        print(f"Time zone: {tz_label} for all photos (from --tz, replacing their stored offsets)")
-    print(f"Track:  {clock(track.start)} -> {clock(track.end)} (UTC{shown_off}, "
-          f"{len(pts)} points, {fmt_dur(track.end - track.start)})")
-    where = os.path.abspath(targets[0]) if targets == ["."] else ", ".join(targets)
-    print(f"Photos: {len(recs)} in {where}" + (" (and subfolders)" if args.recursive else "")
-          + (f", shifted {fmt_shift(args.shift)}" if args.shift else "") + "\n")
+    if not args.quiet:
+        if tz_override is not None:
+            print(f"Time zone: {tz_label} for all photos (from --tz, replacing their stored offsets)")
+        print(f"Track:  {clock(track.start)} -> {clock(track.end)} (UTC{shown_off}, "
+              f"{len(pts)} points, {fmt_dur(track.end - track.start)})")
+        where = os.path.abspath(targets[0]) if targets == ["."] else ", ".join(targets)
+        print(f"Photos: {len(recs)} in {where}" + (" (and subfolders)" if args.recursive else "")
+              + (f", shifted {fmt_shift(args.shift)}" if args.shift else "") + "\n")
 
     # Find a position for each photo. Record a result line for each photo.
     # Put the photos that can get a position into the jobs list.
     jobs: List[Tuple[str, Fix, float]] = []
-    missed: List[Tuple[float, str]] = []   # (timestamp, offset used) of photos outside the track
-    counts = {"no_time": 0, "no_tz": 0, "has_gps": 0, "outside": 0, "gap": 0}
+    # The (timestamp, offset used) of the photos that got a position, and
+    # of the photos outside the track. The time zone hint uses them.
+    placed: List[Tuple[float, str]] = []
+    missed: List[Tuple[float, str]] = []
+    counts = {"no_time": 0, "no_tz": 0, "has_gps": 0, "outside": 0, "gap": 0, "ambiguous": 0}
     rows = []
     for rec in sorted(recs, key=lambda r: r.get("SourceFile", "")):
         path = rec["SourceFile"]
@@ -978,35 +1152,52 @@ def main() -> int:
             rows.append(f"  skip  {name}: already has GPS (use --overwrite)")
             continue
         # Skip a photo that has no capture time or no time zone.
-        ts, why, off = photo_timestamp(rec, tz_override)
-        if ts is None:
+        cands, why = photo_timestamp(rec, tz_override)
+        if not cands:
             counts["no_tz" if "zone" in why else "no_time"] += 1
             rows.append(f"  skip  {name} [{shown}]: {why}")
             continue
-        stamp = f"{shown} UTC{off}"
-        # Apply the --shift value, then find the position.
-        ts += args.shift
-        fix, why = track.locate(ts)
+        # Apply the --shift value, then find the position for each
+        # possible time. Usually there is only one possible time.
+        tried = []
+        for ts, off in cands:
+            fix, why = track.locate(ts + args.shift)
+            tried.append((ts + args.shift, off, fix, why))
+        hits = [x for x in tried if x[2] is not None]
         # Skip a photo that is outside the track or in a gap.
         # Keep its time for the time zone hint.
-        if fix is None:
+        if not hits:
+            ts, off, _, why = tried[0]
             counts["gap" if "gap" in why else "outside"] += 1
             missed.append((ts, off))
-            rows.append(f"  skip  {name} [{stamp}]: {why}")
+            rows.append(f"  skip  {name} [{shown} UTC{off}]: {why}")
             continue
+        ts, off, fix, _ = hits[0]
+        # The clock time was ambiguous (a daylight saving time change).
+        # Tell the user which reading the script used.
+        note = ""
+        if len(hits) > 1:
+            counts["ambiguous"] += 1
+            note = (f"; ambiguous clock time, also fits UTC{hits[1][1]}: "
+                    "check this one")
+        elif len(tried) > 1:
+            note = f"; ambiguous clock time, only the UTC{off} reading fits the track"
         jobs.append((path, fix, ts))
+        placed.append((ts, off))
         how = fix.how if fix.how != "nearest" else f"nearest, {fmt_dur(fix.dt)} off"
         ele = f" {fix.ele:.0f}m" if fix.ele is not None else ""
-        rows.append(f"  {'would' if args.dry_run else 'tag  '} {name} [{stamp}] -> "
-                    f"{fix.lat:.6f},{fix.lon:.6f}{ele} ({how})")
+        rows.append(f"  {'would' if args.dry_run else 'tag  '} {name} [{shown} UTC{off}] -> "
+                    f"{fix.lat:.6f},{fix.lon:.6f}{ele} ({how}{note})")
 
     if not args.quiet:
         print("\n".join(rows) + ("\n" if rows else ""))
 
-    # Write the GPS tags, unless --dry-run is set.
+    # Write the GPS tags, unless --dry-run is set. With --overwrite,
+    # delete the old GPS tags first.
     updated, errors = 0, []
     if jobs and not args.dry_run:
-        updated, errors = write_gps(jobs, args.backup, not args.no_preserve_mtime)
+        updated, errors = write_gps(jobs, args.backup, not args.no_preserve_mtime,
+                                    clear=args.overwrite)
 
     # Show the summary line and the exiftool errors.
     verb = "would tag" if args.dry_run else "tagged"
@@ -1022,46 +1213,20 @@ def main() -> int:
         print(f"  exiftool: {e}", file=sys.stderr)
 
     if not args.quiet:
-        # A wrong time zone moves all photos by full or half hours. Try
-        # each offset from -14 h to +14 h in 30-minute steps. If an offset
-        # places more photos than now, give a hint.
-        # Note: this finds only photos that are outside the track. On a long
-        # track of many days, a wrong time zone can put a photo inside the
-        # track at the wrong position. Examine the --dry-run output.
         if missed:
-            # Find the offset that places the most skipped photos.
-            # If two offsets place the same number, use the smaller offset.
-            best, best_n = 0.0, 0
-            for k in range(-28, 29):              # -14 h to +14 h in 30-minute steps
-                if k == 0:
-                    continue
-                n = sum(1 for t, _ in missed if track.locate(t + k * 1800)[0] is not None)
-                if n > best_n or (n == best_n and abs(k) < abs(best / 1800)):
-                    best, best_n = k * 1800.0, n
-            # Give the hint only if the offset places more photos than now,
-            # and at least half of the skipped photos.
-            if best_n > len(jobs) and best_n >= max(1, len(missed) // 2):
-                used = {o for _, o in missed}
-                if len(used) == 1:
-                    # All skipped photos have the same offset. Suggest a --tz value.
-                    o = used.pop()
-                    om = _OFFSET_RE.match(o)
-                    cur = (1 if om.group(1) == "+" else -1) * timedelta(
-                        hours=int(om.group(2)), minutes=int(om.group(3)))
-                    new = fmt_offset(cur - timedelta(seconds=best))
-                    short = new[:3].replace("+0", "+").replace("-0", "-") if new.endswith(":00") else new
-                    print(f"\nHint: {best_n} of {len(missed)} skipped photos would match if their "
-                          f"time zone were UTC{new}, not UTC{o}. Try --tz {short} (or the "
-                          f"place's name, e.g. --tz \"los angeles\").")
-                else:
-                    # The skipped photos have different offsets. Suggest a --shift value.
-                    print(f"\nHint: {best_n} of {len(missed)} skipped photos would match with "
-                          f"--shift {fmt_shift(args.shift + best)}.")
+            hint = tz_hint(track, placed, missed, args.shift)
+            if hint:
+                print("\n" + hint)
         # Tell the user how to fix photos that have no time zone.
         if counts["no_tz"]:
             print("\nNote: some photos don't record a time zone (older cameras, or files "
                   "edited by software that strips it). Tell gpxtag with --tz, e.g. "
                   "--tz \"los angeles\" or --tz -8.")
+        # Tell the user about photos in an ambiguous hour.
+        if counts["ambiguous"]:
+            print(f"\nNote: {counts['ambiguous']} photo(s) have a clock time that a daylight "
+                  "saving change makes ambiguous, and both readings fit the track. gpxtag "
+                  "used the first one; check them in the list above.")
 
     return 1 if errors or (not args.dry_run and updated < len(jobs)) else 0
 

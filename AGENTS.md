@@ -17,9 +17,13 @@ Everything lives in `gpxtag.py`, split into sections by `# ---` banner comments:
 | --- | --- |
 | GPX parsing | `TrackPoint`, `parse_iso_time`, `_read_gpx`, `load_tracks` |
 | Position lookup | `Fix`, `Track.locate` (exact → interpolate → nearest) |
-| Time helpers | `parse_shift`, `resolve_tz`, `photo_offset`, `photo_timestamp`, `fmt_*` |
-| exiftool I/O | `READ_TAGS`, `read_photos`, `write_gps` |
-| Main | `main()` – argument parsing, the per-photo loop, summary, hints |
+| Time helpers | `parse_shift`, `parse_offset`, `resolve_tz`, `photo_offset`, `photo_timestamp`, `fmt_*` |
+| exiftool I/O | `READ_TAGS`, `MIN_EXIFTOOL`, `exiftool_version`, `read_photos`, `write_gps` |
+| Main | `tz_hint` (time-zone hint), `main()` – argument parsing, the per-photo loop, summary |
+
+Parse "+HH:MM" offset text with `parse_offset`; don't hand-roll it again.
+`photo_timestamp` returns a *list* of candidate times, which has two entries
+for a clock time made ambiguous by a DST change under a `--tz` place.
 
 The module docstring doubles as the `--help` epilog (everything from
 "Time zones are" onward), so edit it with that in mind.

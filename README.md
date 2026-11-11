@@ -63,12 +63,12 @@ without writing anything.
 | `--shift [-]H:MM[:SS]` | `0` | Amount to add to every photo time, to correct a camera clock that was simply wrong. Plain seconds (`90`) also work. |
 | `--max-gap SEC` | `300` | Largest gap between two track points that will be interpolated across. |
 | `--tolerance SEC` | `60` | Snap to the nearest track point if it is within this many seconds. Also lets photos slightly before or after the track match. |
-| `--overwrite` | off | Replace GPS data on photos that already have it. By default those photos are skipped. |
+| `--overwrite` | off | Replace GPS data on photos that already have it. All existing EXIF GPS tags are removed first, so nothing stale (e.g. an old altitude) is left behind. By default those photos are skipped. |
 | `--ext EXT` | still images | Only process this extension. Repeatable (`--ext jpg --ext arw`). Without it, every file exiftool identifies as `image/*` is processed. |
 | `-n`, `--dry-run` | off | Show what would be done; write nothing. |
 | `--backup` | off | Keep exiftool's `FILE_original` backup copies. By default files are modified in place. |
 | `--no-preserve-mtime` | off | Let file modification times change. By default they are preserved. |
-| `-q`, `--quiet` | off | Only print the summary line. |
+| `-q`, `--quiet` | off | Only print the summary line (plus any errors). |
 
 ## How it works
 
@@ -83,8 +83,18 @@ nothing needs to be configured. For each photo, the offset is chosen in this
 order:
 
 1. `--tz`, if given (applies to every photo in the run)
-2. The offset stored in the photo
+2. The offset stored in the photo, starting with the one that belongs to the
+   date tag used (`OffsetTimeOriginal` for `DateTimeOriginal`,
+   `OffsetTimeDigitized` for `CreateDate`)
 3. A time zone written inside the date/time value itself
+
+Fixed `--tz` offsets must be real ones, from `-12:00` to `+14:00`.
+
+With a `--tz` place, a clock time can be ambiguous around a daylight-saving
+change: the hour that repeats when clocks go back, or the hour that is skipped
+when they go forward. `gpxtag` tries both readings. If only one fits the track
+it uses that one; if both fit, it uses the first and flags the photo so you
+can check it.
 
 Photos with no offset from any of these are skipped, and `gpxtag` tells you to
 use `--tz`.
@@ -119,7 +129,8 @@ from one segment or file to another.
 
 ### What gets written
 
-For each matched photo, `gpxtag` writes `GPSLatitude`/`Ref`,
+For each matched photo, `gpxtag` writes (after clearing old GPS tags, with
+`--overwrite`) `GPSLatitude`/`Ref`,
 `GPSLongitude`/`Ref`, `GPSDateStamp`, `GPSTimeStamp` (UTC), `GPSMapDatum`
 (`WGS-84`), and — if the track has elevation — `GPSAltitude`/`Ref`. All photos
 are written in a single exiftool run.
@@ -128,8 +139,12 @@ are written in a single exiftool run.
 
 If photos fall outside the track, `gpxtag` tries every offset from −14 h to
 +14 h in 30-minute steps. If one of them would place at least half of the
-skipped photos (and more than were matched), it prints a hint suggesting a
-`--tz` (or `--shift`) value to try.
+skipped photos, it works out what the suggested `--tz` (or `--shift`) would do
+to *every* photo, including those already matched:
+
+- If more photos would match in total, it suggests that option.
+- If not (for example, a few photos from a second camera with a wrong clock),
+  it suggests tagging the skipped photos in a separate run instead.
 
 This only detects photos that land *outside* the track. On a multi-day track,
 a wrong time zone can place a photo *inside* the track at the wrong position,
